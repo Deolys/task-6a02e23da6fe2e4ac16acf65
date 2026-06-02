@@ -1,96 +1,174 @@
 """
-Agent with RAG memory using ChromaDB instead of Qdrant.
+Main implementation of an RAG agent using Qdrant, Ollama and LangChain.
+The code follows the instructor feedback:
+- Uses Qdrant as vector store instead of ChromaDB.
+- Uses current LangChain APIs (v0.2).
+- Embeddings are generated with Ollama (`nomic-embed-text`).
+- LLM is Ollama (`llama3`).
 """
+
 import os
 from pathlib import Path
 from typing import List, Dict
 
-# LangChain imports
-from langchain.embeddings import OllamaEmbeddings
-from langchain.vectorstores import Chroma
+# Load environment variables if any
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:  # pragma: no cover - optional dependency
+    pass
+
+# LangChain imports (v0.2)
+from langchain_community.vectorstores.qdrant import QdrantVectorStore
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.llms import Ollama
+from langchain.schema import Document
+from langchain.agents import Tool, AgentExecutor, create_openai_functions_agent
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.tools import tool
-from langchain.agents import AgentExecutor, create_openai_functions_agent
-from langchain.llms import Ollama
 
+# -----------------------------
 # Configuration
-CHROMA_DIR = "./chroma"
-DOCS_DIR = "./docs"
-EMBEDDING_MODEL = "nomic-embed-text"
-LLM_MODEL = "llama3"
+# -----------------------------
+QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "rag_agent_collection")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
 
-# Initialize embeddings and LLM
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-lm = Ollama(model=LLM_MODEL, temperature=0.2)
+# -----------------------------
+# Vector store helper
+# -----------------------------
+class QdrantStore:
+    def __init__(self, url: str = QDRANT_URL, collection_name: str = QDRANT_COLLECTION):
+        self.url = url
+        self.collection_name = collection_name
+        # Initialize embeddings and vector store lazily
+        self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+        self.store: QdrantVectorStore | None = None
 
-# Initialize or load Chroma vector store
-vector_store = Chroma(persist_directory=CHROMA_DIR, embedding_function=embeddings)
+    def _ensure_store(self):
+        if self.store is None:
+            self.store = QdrantVectorStore.from_texts(
+                texts=[],  # start empty; will add later
+                embedding=self.embeddings,
+                url=self.url,
+                collection_name=self.collection_name,
+            )
 
-# Text splitter for chunking documents
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    def add_documents(self, docs: List[Document]):
+        self._ensure_store()
+        self.store.add_documents(docs)
 
-@tool("search_knowledge_base")
-def search_knowledge_base(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Semantic search in the knowledge base."""
-    results = vector_store.similarity_search_with_score(query, k=max_results)
-    return [{"content": doc.page_content, "score": score} for doc, score in results]
+    def similarity_search(self, query: str, k: int = 4) -> List[Document]:
+        self._ensure_store()
+        return self.store.similarity_search(query=query, k=k)
 
-@tool("add_to_knowledge_base")
-def add_to_knowledge_base(content: str, title: str) -> str:
-    """Add a document to the knowledge base."""
-    docs = text_splitter.split_text(content)
-    vector_store.add_documents([{"page_content": d, "metadata": {"title": title}} for d in docs])
-    return f"Document '{title}' added with {len(docs)} chunks."
+# -----------------------------
+# Tools for the agent
+# -----------------------------
+store = QdrantStore()
 
-# Agent setup
-tools = [search_knowledge_base, add_to_knowledge_base]
-agent_executor = AgentExecutor.from_agent_and_tools(
-    agent=create_openai_functions_agent(llm=lm, tools=tools),
-    tools=tools,
-    verbose=True,
+def _search_knowledge_base(query: str, max_results: int = 4) -> List[Dict]:
+    """Return top documents as list of dicts with content and metadata."""
+    docs = store.similarity_search(query=query, k=max_results)
+    return [{"content": d.page_content, **d.metadata} for d in docs]
+
+def _add_to_knowledge_base(content: str, title: str) -> str:
+    """Add a single document to the vector store."""
+    doc = Document(page_content=content, metadata={"title": title})
+    store.add_documents([doc])
+    return f"Document '{title}' added successfully."
+
+search_tool = Tool(
+    name="search_knowledge_base",
+    func=_search_knowledge_base,
+    description=(
+        "Search the knowledge base for relevant documents.\n"
+        "Parameters:\n"
+        "- query (str): The search query.\n"
+        "- max_results (int, optional): Number of results to return. Defaults to 4."
+    ),
 )
 
-def load_documents_from_dir(directory: str):
-    """Load all text files from a directory into the vector store."""
-    for file_path in Path(directory).glob("**/*.txt"):
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        title = file_path.stem
-        add_to_knowledge_base(content, title)
+add_tool = Tool(
+    name="add_to_knowledge_base",
+    func=_add_to_knowledge_base,
+    description=(
+        "Add a new document to the knowledge base.\n"
+        "Parameters:\n"
+        "- content (str): The full text of the document.\n"
+        "- title (str): A short title for the document."
+    ),
+)
 
+# -----------------------------
+# Agent setup
+# -----------------------------
+llm = Ollama(model=LLM_MODEL, temperature=0.7)
+agent = create_openai_functions_agent(llm=llm, tools=[search_tool, add_tool])
+executor = AgentExecutor(agent=agent, tools=[search_tool, add_tool], verbose=True)
+
+# -----------------------------
+# Document ingestion helper (used by init script)
+# -----------------------------
+def ingest_directory(directory: str):
+    """Load all .txt files from a directory, chunk them and add to store."""
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    docs: List[Document] = []
+    for path in Path(directory).rglob("*.txt"):
+        text = path.read_text(encoding="utf-8")
+        chunks = splitter.split_text(text)
+        for i, chunk in enumerate(chunks):
+            meta = {"source": str(path), "chunk_index": i}
+            docs.append(Document(page_content=chunk, metadata=meta))
+    store.add_documents(docs)
+
+# -----------------------------
+# Interactive CLI
+# -----------------------------
 if __name__ == "__main__":
-    # Load existing docs if any
-    load_documents_from_dir(DOCS_DIR)
-    print("Agent ready. Use /add <title> <path>, /search <query>, or /quit.")
-    while True:
-        user_input = input(">>> ").strip()
-        if not user_input:
-            continue
-        if user_input.lower() == "/quit":
-            print("Goodbye!")
-            break
-        if user_input.startswith("/add"):
-            parts = user_input.split(maxsplit=2)
-            if len(parts) < 3:
-                print("Usage: /add <title> <path>")
-                continue
-            title, path = parts[1], parts[2]
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                result = add_to_knowledge_base(content, title)
-                print(result)
-            except Exception as e:
-                print(f"Error adding document: {e}")
-        elif user_input.startswith("/search"):
-            query = user_input[len("/search"):].strip()
-            if not query:
-                print("Usage: /search <query>")
-                continue
-            results = search_knowledge_base(query, max_results=3)
-            for i, res in enumerate(results, 1):
-                print(f"{i}. (score {res['score']:.4f}) {res['content'][:200]}...")
-        else:
-            # Treat as normal query to agent
-            response = agent_executor.invoke({"input": user_input})
-            print(response["output"])
+    import argparse
+
+    parser = argparse.ArgumentParser(description="RAG Agent CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # init command
+    init_parser = subparsers.add_parser("init", help="Load documents from a directory into the vector store")
+    init_parser.add_argument("dir", type=str, help="Directory containing .txt files to ingest")
+
+    # add command
+    add_parser = subparsers.add_parser("add", help="Add a document via CLI")
+    add_parser.add_argument("title", type=str, help="Title of the document")
+    add_parser.add_argument("file", type=str, help="Path to text file containing content")
+
+    # search command
+    search_parser = subparsers.add_parser("search", help="Search knowledge base")
+    search_parser.add_argument("query", type=str, help="Query string")
+    search_parser.add_argument("-k", type=int, default=4, help="Number of results")
+
+    # chat command (interactive agent)
+    chat_parser = subparsers.add_parser("chat", help="Start interactive chat with the agent")
+
+    args = parser.parse_args()
+
+    if args.command == "init":
+        ingest_directory(args.dir)
+        print(f"Ingested documents from {args.dir}")
+    elif args.command == "add":
+        content = Path(args.file).read_text(encoding="utf-8")
+        result = _add_to_knowledge_base(content, args.title)
+        print(result)
+    elif args.command == "search":
+        results = _search_knowledge_base(args.query, max_results=args.k)
+        for i, res in enumerate(results, 1):
+            print(f"Result {i}: {res.get('title', 'no title')}\n{res['content'][:500]}...\n")
+    elif args.command == "chat":
+        print("Enter your messages. Type /quit to exit.")
+        while True:
+            user_input = input("You: ")
+            if user_input.strip() == "/quit":
+                break
+            response = executor.invoke({"input": user_input})
+            print(f"Agent: {response['output']}")
+    else:
+        parser.print_help()
+"
