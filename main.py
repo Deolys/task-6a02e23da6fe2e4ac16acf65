@@ -1,174 +1,126 @@
 """
-Main implementation of an RAG agent using Qdrant, Ollama and LangChain.
-The code follows the instructor feedback:
-- Uses Qdrant as vector store instead of ChromaDB.
-- Uses current LangChain APIs (v0.2).
-- Embeddings are generated with Ollama (`nomic-embed-text`).
-- LLM is Ollama (`llama3`).
+RAG Agent with Qdrant and Ollama
+Author: Auto-generated for task 6a02e23da6fe2e4ac16acf65
 """
-
 import os
 from pathlib import Path
 from typing import List, Dict
 
-# Load environment variables if any
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:  # pragma: no cover - optional dependency
-    pass
-
-# LangChain imports (v0.2)
-from langchain_community.vectorstores.qdrant import QdrantVectorStore
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.llms import Ollama
-from langchain.schema import Document
-from langchain.agents import Tool, AgentExecutor, create_openai_functions_agent
+# LangChain imports
+from langchain_ollama import OllamaEmbeddings
+from langchain_qdrant import QdrantVectorStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.tools import tool
+from langchain.agents import AgentExecutor, create_openai_functions_agent
+from langchain.schema import Document
 
 # -----------------------------
 # Configuration
 # -----------------------------
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "rag_agent_collection")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+COLLECTION_NAME = "knowledge_base"
+EMBEDDING_MODEL = "nomic-embed-text"
+LLM_MODEL = "llama3:latest"
 
 # -----------------------------
-# Vector store helper
+# Vector store setup
 # -----------------------------
-class QdrantStore:
-    def __init__(self, url: str = QDRANT_URL, collection_name: str = QDRANT_COLLECTION):
-        self.url = url
-        self.collection_name = collection_name
-        # Initialize embeddings and vector store lazily
-        self.embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-        self.store: QdrantVectorStore | None = None
-
-    def _ensure_store(self):
-        if self.store is None:
-            self.store = QdrantVectorStore.from_texts(
-                texts=[],  # start empty; will add later
-                embedding=self.embeddings,
-                url=self.url,
-                collection_name=self.collection_name,
-            )
-
-    def add_documents(self, docs: List[Document]):
-        self._ensure_store()
-        self.store.add_documents(docs)
-
-    def similarity_search(self, query: str, k: int = 4) -> List[Document]:
-        self._ensure_store()
-        return self.store.similarity_search(query=query, k=k)
-
-# -----------------------------
-# Tools for the agent
-# -----------------------------
-store = QdrantStore()
-
-def _search_knowledge_base(query: str, max_results: int = 4) -> List[Dict]:
-    """Return top documents as list of dicts with content and metadata."""
-    docs = store.similarity_search(query=query, k=max_results)
-    return [{"content": d.page_content, **d.metadata} for d in docs]
-
-def _add_to_knowledge_base(content: str, title: str) -> str:
-    """Add a single document to the vector store."""
-    doc = Document(page_content=content, metadata={"title": title})
-    store.add_documents([doc])
-    return f"Document '{title}' added successfully."
-
-search_tool = Tool(
-    name="search_knowledge_base",
-    func=_search_knowledge_base,
-    description=(
-        "Search the knowledge base for relevant documents.\n"
-        "Parameters:\n"
-        "- query (str): The search query.\n"
-        "- max_results (int, optional): Number of results to return. Defaults to 4."
-    ),
+embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+vector_store = QdrantVectorStore(
+    url=f"http://{QDRANT_HOST}:{QDRANT_PORT}",
+    collection_name=COLLECTION_NAME,
+    embeddings=embeddings,
 )
 
-add_tool = Tool(
-    name="add_to_knowledge_base",
-    func=_add_to_knowledge_base,
-    description=(
-        "Add a new document to the knowledge base.\n"
-        "Parameters:\n"
-        "- content (str): The full text of the document.\n"
-        "- title (str): A short title for the document."
-    ),
-)
+# -----------------------------
+# Text splitter
+# -----------------------------
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+# -----------------------------
+# Tools
+# -----------------------------
+@tool("search_knowledge_base", "Search the knowledge base for relevant documents.")
+def search_knowledge_base(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """Return a list of dictionaries with keys 'title' and 'content'."""
+    docs = vector_store.similarity_search_with_score(query, k=max_results)
+    results = []
+    for doc, score in docs:
+        meta = doc.metadata or {}
+        results.append({
+            "title": meta.get("title", "No title"),
+            "content": doc.page_content,
+            "score": f"{score:.4f}",
+        })
+    return results
+
+@tool("add_to_knowledge_base", "Add a new document to the knowledge base.")
+def add_to_knowledge_base(content: str, title: str = "Untitled") -> str:
+    """Split content into chunks and store them with metadata."""
+    chunks = text_splitter.split_text(content)
+    metadatas = [{"title": title} for _ in chunks]
+    vector_store.add_texts(chunks, metadatas=metadatas)
+    return f"Added {len(chunks)} chunk(s) to the knowledge base under title '{title}'."
 
 # -----------------------------
 # Agent setup
 # -----------------------------
-llm = Ollama(model=LLM_MODEL, temperature=0.7)
-agent = create_openai_functions_agent(llm=llm, tools=[search_tool, add_tool])
-executor = AgentExecutor(agent=agent, tools=[search_tool, add_tool], verbose=True)
+TOOLS = [search_knowledge_base, add_to_knowledge_base]
+AGENT = create_openai_functions_agent(LLM_MODEL, TOOLS)
+EXECUTOR = AgentExecutor(agent=AGENT, tools=TOOLS, verbose=True)
 
 # -----------------------------
-# Document ingestion helper (used by init script)
+# CLI
 # -----------------------------
-def ingest_directory(directory: str):
-    """Load all .txt files from a directory, chunk them and add to store."""
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    docs: List[Document] = []
-    for path in Path(directory).rglob("*.txt"):
-        text = path.read_text(encoding="utf-8")
-        chunks = splitter.split_text(text)
-        for i, chunk in enumerate(chunks):
-            meta = {"source": str(path), "chunk_index": i}
-            docs.append(Document(page_content=chunk, metadata=meta))
-    store.add_documents(docs)
+def print_help():
+    help_text = """
+Commands:
+  /add <title> | <content>   Add a document to the knowledge base.
+  /search <query>            Search the knowledge base.
+  /quit                      Exit the program.
+  /help                      Show this help message.
+"""
+    print(help_text)
 
-# -----------------------------
-# Interactive CLI
-# -----------------------------
+def main():
+    print("RAG Agent CLI. Type /help for commands.")
+    while True:
+        try:
+            user_input = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nExiting.")
+            break
+        if not user_input:
+            continue
+        if user_input.startswith("/add"):
+            parts = user_input.split("|", 1)
+            if len(parts) != 2:
+                print("Usage: /add <title> | <content>")
+                continue
+            title, content = [p.strip() for p in parts]
+            result = add_to_knowledge_base(content=content, title=title)
+            print(result)
+        elif user_input.startswith("/search"):
+            query = user_input[len("/search"):].strip()
+            if not query:
+                print("Please provide a search query.")
+                continue
+            results = search_knowledge_base(query=query, max_results=5)
+            if not results:
+                print("No relevant documents found.")
+            else:
+                for i, res in enumerate(results, 1):
+                    print(f"\nResult {i}: (score {res['score']}) Title: {res['title']}\n{res['content'][:500]}...")
+        elif user_input == "/quit":
+            print("Goodbye!")
+            break
+        elif user_input == "/help":
+            print_help()
+        else:
+            # Treat as a normal prompt to the agent
+            response = EXECUTOR.invoke({"input": user_input})
+            print(response.get("output", ""))
+
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="RAG Agent CLI")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    # init command
-    init_parser = subparsers.add_parser("init", help="Load documents from a directory into the vector store")
-    init_parser.add_argument("dir", type=str, help="Directory containing .txt files to ingest")
-
-    # add command
-    add_parser = subparsers.add_parser("add", help="Add a document via CLI")
-    add_parser.add_argument("title", type=str, help="Title of the document")
-    add_parser.add_argument("file", type=str, help="Path to text file containing content")
-
-    # search command
-    search_parser = subparsers.add_parser("search", help="Search knowledge base")
-    search_parser.add_argument("query", type=str, help="Query string")
-    search_parser.add_argument("-k", type=int, default=4, help="Number of results")
-
-    # chat command (interactive agent)
-    chat_parser = subparsers.add_parser("chat", help="Start interactive chat with the agent")
-
-    args = parser.parse_args()
-
-    if args.command == "init":
-        ingest_directory(args.dir)
-        print(f"Ingested documents from {args.dir}")
-    elif args.command == "add":
-        content = Path(args.file).read_text(encoding="utf-8")
-        result = _add_to_knowledge_base(content, args.title)
-        print(result)
-    elif args.command == "search":
-        results = _search_knowledge_base(args.query, max_results=args.k)
-        for i, res in enumerate(results, 1):
-            print(f"Result {i}: {res.get('title', 'no title')}\n{res['content'][:500]}...\n")
-    elif args.command == "chat":
-        print("Enter your messages. Type /quit to exit.")
-        while True:
-            user_input = input("You: ")
-            if user_input.strip() == "/quit":
-                break
-            response = executor.invoke({"input": user_input})
-            print(f"Agent: {response['output']}")
-    else:
-        parser.print_help()
-"
+    main()
