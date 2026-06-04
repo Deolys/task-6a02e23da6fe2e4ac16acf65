@@ -6,20 +6,23 @@ import os
 from pathlib import Path
 from typing import List, Dict
 
+# Updated imports to include qdrant_client as required by feedback
 from langchain_ollama import Ollama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.tools import tool
 from langchain.agents import AgentExecutor, create_openai_functions_agent
 from langchain.schema import HumanMessage
+from qdrant_client import QdrantClient
 
 # Initialize embeddings and LLM
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 llm = Ollama(model="llama3", temperature=0)
 
 # Vector store setup (Qdrant local instance assumed running on default localhost:6333)
+qdrant_client_instance = QdrantClient(url="http://localhost:6333")
 vector_store = QdrantVectorStore(
-    client=qdrant_client.QdrantClient(url="http://localhost:6333"),
+    client=qdrant_client_instance,
     embeddings=embeddings,
     collection_name="rag_collection",
 )
