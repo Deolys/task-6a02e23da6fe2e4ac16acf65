@@ -1,7 +1,7 @@
 import os
 from typing import List, Dict
 
-# Современные импорты LangChain и Ollama
+# Современные импорты LangChain
 from langchain_qdrant import QdrantVectorStore
 from langchain_ollama import OllamaEmbeddings, ChatOllama
 from langchain_core.documents import Document
@@ -11,34 +11,33 @@ from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from qdrant_client import QdrantClient
 
-# 1. Инициализация эмбеддингов
+# 1. Настройка эмбеддингов через Ollama
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
-# 2. Локальный клиент Qdrant (в памяти для тестирования, либо укажите url/path)
-client = QdrantClient(location=":memory:")
+# 2. Локальный клиент Qdrant (в памяти для тестирования)
+# Для Docker используйте: client = QdrantClient(url="http://localhost:6333")
+qdrant_client = QdrantClient(location=":memory:")
 collection_name = "knowledge_base"
 
-# Создаем векторное хранилище
-# Важно: в langchain_qdrant метод from_documents или явный конструктор требует qdrant_client
 vector_store = QdrantVectorStore(
-    client=client,
+    client=qdrant_client,
     collection_name=collection_name,
     embedding=embeddings,
 )
 
-# 3. Настройка чанкера
+# 3. Система чанкинга
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
 
-# 4. Определение RAG-инструментов через @tool
+# 4. RAG-инструменты для агента через декоратор @tool
 @tool
 def search_knowledge_base(query: str, max_results: int = 3) -> str:
-    """Семантический поиск в базе знаний. Возвращает текстовую строку с найденными кусками данных."""
-    # similarity_search_with_relevance_scores возвращает кортежи (Document, score)
+    """Семантический поиск в базе знаний. Возвращает найденные текстовые фрагменты."""
+    # Используем поиск с метрикой релевантности
     results = vector_store.similarity_search_with_relevance_scores(query, k=max_results)
     
     if not results:
-        return "В базе знаний ничего не найдено по этому запросу."
+        return "В базе знаний не найдено релевантной информации."
         
     formatted_results = []
     for idx, (doc, score) in enumerate(results, 1):
@@ -51,62 +50,67 @@ def search_knowledge_base(query: str, max_results: int = 3) -> str:
 
 @tool
 def add_to_knowledge_base(content: str, title: str = "Инструкция") -> str:
-    """Добавление нового документа или текста в базу знаний с автоматическим разбиением на чанки."""
+    """Добавление документа в базу знаний с автоматическим разбиением на чанки."""
     chunks = splitter.split_text(content)
     docs: List[Document] = []
+    
     for i, chunk in enumerate(chunks):
         meta = {"title": title, "chunk_index": i}
         docs.append(Document(page_content=chunk, metadata=meta))
-    
+        
     vector_store.add_documents(docs)
-    return f"Успешно добавлено. Документ '{title}' разбит на {len(chunks)} чанков и сохранен."
+    return f"Успешно добавлено. Документ '{title}' разбит на {len(chunks)} чанков и сохранен в Qdrant."
 
 
-# Список инструментов для агента
+# Список инструментов, доступных агенту
 tools = [search_knowledge_base, add_to_knowledge_base]
 
-# 5. Инициализация современной LLM с поддержкой вызова инструментов
+# 5. Инициализация современной модели ChatOllama
 llm = ChatOllama(
-    model="llama3", 
-    temperature=0,
-    # Некоторые версии Ollama требуют явного включения, если модель поддерживает native tools
+    model="llama3",
+    temperature=0  # Низкая температура для точности работы RAG
 )
 
-# 6. Системный промпт для RAG-агента
+# Системный промпт, инструктирующий агента использовать базу знаний
 prompt = ChatPromptTemplate.from_messages([
     ("system", (
-        "Ты — полезный AI-агент с доступом к локальной базе знаний (RAG).\n"
-        "Твоя задача — отвечать на вопросы пользователя. Если у тебя нет ответа, "
-        "обязательно используй инструмент `search_knowledge_base` для поиска информации.\n"
-        "Если пользователь делится важными фактами, которых нет в твоей памяти, "
-        "используй `add_to_knowledge_base`, чтобы сохранить их.\n"
-        "Всегда отвечай на русском языке."
+        "Ты — экспертный AI-агент с интеграцией RAG-памяти.\n"
+        "Твоя задача — отвечать на вопросы пользователя на основе доступных знаний.\n"
+        "Если у тебя нет точной информации для ответа, ты ОБЯЗАН вызвать инструмент `search_knowledge_base`.\n"
+        "Если пользователь предоставляет новые важные факты или инструкции, сохрани их через `add_to_knowledge_base`.\n"
+        "Всегда общайся с пользователем на русском языке."
     )),
     MessagesPlaceholder(variable_name="chat_history", optional=True),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-# Создание современного агента (взамен устаревшего OpenAI functions)
+# Создание агента и исполнителя (AgentExecutor)
 agent = create_tool_calling_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+agent_executor = AgentExecutor(
+    agent=agent, 
+    tools=tools, 
+    verbose=True, 
+    handle_parsing_errors=True
+)
 
 
-# 7. Интерактивный CLI-клиент
+# 6. Интерактивный тестовый клиент (CLI)
 if __name__ == "__main__":
-    print("="*60)
-    print("Добро пожаловать в RAG-Agent CLI!")
-    print("Команды:\n  /add <название> | <текст> - Добавить в базу напрямую")
-    print("  /search <запрос>           - Прямой поиск по базе")
-    print("  /quit                      - Выход")
-    print("  Любой другой текст расценивается как обращение к Агенту.")
-    print("="*60)
+    print("=" * 60)
+    print("Запущен интерактивный клиент RAG-Агента.")
+    print("Доступные команды:")
+    print("  /add <название> | <текст> - Прямое добавление в базу")
+    print("  /search <запрос>           - Прямой семантический поиск")
+    print("  /quit                      - Выход из программы")
+    print("  Любой другой текст будет передан Агенту для анализа.")
+    print("=" * 60)
     
     while True:
         try:
             user_input = input("\nВы > ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nДо свидания!")
+            print("\nЗавершение работы.")
             break
             
         if not user_input:
@@ -123,30 +127,29 @@ if __name__ == "__main__":
                 title = title.strip()
                 content = content.strip()
             except ValueError:
-                print("Ошибка формата! Используйте: /add Название документа | Текст документа")
+                print("Ошибка! Формат: /add Название | Текст документа")
                 continue
-            
-            # Вызов функции напрямую (минуя агента)
-            result = add_to_knowledge_base.invoke({"content": content, "title": title})
-            print(f"[Система]: {result}")
+                
+            # Вызов логики инструмента напрямую для обхода агента
+            res = add_to_knowledge_base.invoke({"content": content, "title": title})
+            print(f"[Система]: {res}")
             
         elif user_input.startswith("/search"):
             try:
                 _, query = user_input.split(" ", 1)
                 query = query.strip()
             except ValueError:
-                print("Ошибка формата! Используйте: /search Ваш поисковый запрос")
+                print("Ошибка! Формат: /search Ваш запрос")
                 continue
                 
-            # Вызов поиска напрямую
-            result = search_knowledge_base.invoke({"query": query})
-            print(f"[База Знаний]:\n{result}")
+            res = search_knowledge_base.invoke({"query": query})
+            print(f"[База Данных]:\n{res}")
             
         else:
-            # Обращение к LLM-агенту, который сам решит, вызывать ли инструменты
-            print("[Агент думает...]")
+            # Отправка свободного запроса агенту
+            print("[Агент обрабатывает запрос...]")
             try:
                 response = agent_executor.invoke({"input": user_input})
-                print(f"Ответ Агента: {response['output']}")
+                print(f"\nОтвет Агента:\n{response['output']}")
             except Exception as e:
-                print(f"Произошла ошибка при работе агента: {e}")
+                print(f"Ошибка выполнения: {e}")
