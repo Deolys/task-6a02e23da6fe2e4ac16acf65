@@ -6,120 +6,90 @@ import os
 from pathlib import Path
 from typing import List, Dict
 
-# LangChain imports
-from langchain_ollama import OllamaEmbeddings
+from langchain_ollama import Ollama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.tools import tool
 from langchain.agents import AgentExecutor, create_openai_functions_agent
-from langchain.schema import Document
+from langchain.schema import HumanMessage
 
-# -----------------------------
-# Configuration
-# -----------------------------
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-COLLECTION_NAME = "knowledge_base"
-EMBEDDING_MODEL = "nomic-embed-text"
-LLM_MODEL = "llama3:latest"
+# Initialize embeddings and LLM
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+llm = Ollama(model="llama3", temperature=0)
 
-# -----------------------------
-# Vector store setup
-# -----------------------------
-embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+# Vector store setup (Qdrant local instance assumed running on default localhost:6333)
 vector_store = QdrantVectorStore(
-    url=f"http://{QDRANT_HOST}:{QDRANT_PORT}",
-    collection_name=COLLECTION_NAME,
+    client=qdrant_client.QdrantClient(url="http://localhost:6333"),
     embeddings=embeddings,
+    collection_name="rag_collection",
 )
 
-# -----------------------------
-# Text splitter
-# -----------------------------
-text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+# Text splitter configuration
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
 
-# -----------------------------
-# Tools
-# -----------------------------
-@tool("search_knowledge_base", "Search the knowledge base for relevant documents.")
-def search_knowledge_base(query: str, max_results: int = 5) -> List[Dict[str, str]]:
-    """Return a list of dictionaries with keys 'title' and 'content'."""
-    docs = vector_store.similarity_search_with_score(query, k=max_results)
-    results = []
-    for doc, score in docs:
-        meta = doc.metadata or {}
-        results.append({
-            "title": meta.get("title", "No title"),
-            "content": doc.page_content,
-            "score": f"{score:.4f}",
-        })
-    return results
+@tool("search_knowledge_base")
+def search_knowledge_base(query: str, max_results: int = 5) -> List[Dict]:
+    """
+    Perform a semantic search in the knowledge base.
+    Returns a list of documents with their metadata and score.
+    """
+    results = vector_store.similarity_search_with_score(query, k=max_results)
+    return [{"content": doc.page_content, "metadata": doc.metadata, "score": score} for doc, score in results]
 
-@tool("add_to_knowledge_base", "Add a new document to the knowledge base.")
-def add_to_knowledge_base(content: str, title: str = "Untitled") -> str:
-    """Split content into chunks and store them with metadata."""
-    chunks = text_splitter.split_text(content)
-    metadatas = [{"title": title} for _ in chunks]
-    vector_store.add_texts(chunks, metadatas=metadatas)
-    return f"Added {len(chunks)} chunk(s) to the knowledge base under title '{title}'."
+@tool("add_to_knowledge_base")
+def add_to_knowledge_base(content: str, title: str = "") -> str:
+    """
+    Add a new document to the knowledge base.
+    The content is split into chunks before being stored.
+    Returns the number of chunks added.
+    """
+    docs = text_splitter.split_text(content)
+    vector_store.add_documents([{"page_content": d, "metadata": {"title": title}} for d in docs])
+    return f"Added {len(docs)} chunks to the knowledge base."
 
-# -----------------------------
 # Agent setup
-# -----------------------------
-TOOLS = [search_knowledge_base, add_to_knowledge_base]
-AGENT = create_openai_functions_agent(LLM_MODEL, TOOLS)
-EXECUTOR = AgentExecutor(agent=AGENT, tools=TOOLS, verbose=True)
+SYSTEM_PROMPT = (
+    "You are an AI assistant that can search and add documents to a local RAG knowledge base using Qdrant and Ollama embeddings."
+)
+agent_executor = AgentExecutor.from_agent_and_tools(
+    agent=create_openai_functions_agent(llm=llm, tools=[search_knowledge_base, add_to_knowledge_base], system_message=SYSTEM_PROMPT),
+    tools=[search_knowledge_base, add_to_knowledge_base],
+    verbose=True,
+)
 
-# -----------------------------
-# CLI
-# -----------------------------
-def print_help():
-    help_text = """
-Commands:
-  /add <title> | <content>   Add a document to the knowledge base.
-  /search <query>            Search the knowledge base.
-  /quit                      Exit the program.
-  /help                      Show this help message.
-"""
-    print(help_text)
-
+# Simple CLI client
 def main():
-    print("RAG Agent CLI. Type /help for commands.")
+    print("Welcome to the RAG Agent CLI. Commands: /add <title> <content>, /search <query>, /quit")
     while True:
         try:
-            user_input = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nExiting.")
+            user_input = input(">>> ")
+        except EOFError:
             break
-        if not user_input:
+        if not user_input.strip():
             continue
-        if user_input.startswith("/add"):
-            parts = user_input.split("|", 1)
-            if len(parts) != 2:
-                print("Usage: /add <title> | <content>")
+        if user_input.startswith("/quit"):
+            print("Goodbye!")
+            break
+        elif user_input.startswith("/add"):
+            parts = user_input.split(maxsplit=2)
+            if len(parts) < 3:
+                print("Usage: /add <title> <content>")
                 continue
-            title, content = [p.strip() for p in parts]
-            result = add_to_knowledge_base(content=content, title=title)
+            title, content = parts[1], parts[2]
+            result = add_to_knowledge_base(content, title)
             print(result)
         elif user_input.startswith("/search"):
             query = user_input[len("/search"):].strip()
             if not query:
-                print("Please provide a search query.")
+                print("Usage: /search <query>")
                 continue
-            results = search_knowledge_base(query=query, max_results=5)
-            if not results:
-                print("No relevant documents found.")
-            else:
-                for i, res in enumerate(results, 1):
-                    print(f"\nResult {i}: (score {res['score']}) Title: {res['title']}\n{res['content'][:500]}...")
-        elif user_input == "/quit":
-            print("Goodbye!")
-            break
-        elif user_input == "/help":
-            print_help()
+            results = search_knowledge_base(query, max_results=3)
+            for i, res in enumerate(results, 1):
+                print(f"Result {i}: (score={res['score']:.4f}) Title: {res['metadata'].get('title', 'N/A')}")
+                print(res["content"][:200] + "...")
         else:
-            # Treat as a normal prompt to the agent
-            response = EXECUTOR.invoke({"input": user_input})
+            # Treat as normal user message to agent
+            response = agent_executor.invoke({"input": user_input})
             print(response.get("output", ""))
 
 if __name__ == "__main__":
