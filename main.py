@@ -11,7 +11,7 @@ from langchain_ollama import Ollama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.tools import tool
-from langchain.agents import AgentExecutor, create_openai_functions_agent
+from langchain.agents import create_agent
 from langchain.schema import HumanMessage
 from qdrant_client import QdrantClient
 
@@ -50,15 +50,11 @@ def add_to_knowledge_base(content: str, title: str = "") -> str:
     vector_store.add_documents([{"page_content": d, "metadata": {"title": title}} for d in docs])
     return f"Added {len(docs)} chunks to the knowledge base."
 
-# Agent setup
+# Agent setup using create_agent (feedback requirement)
 SYSTEM_PROMPT = (
     "You are an AI assistant that can search and add documents to a local RAG knowledge base using Qdrant and Ollama embeddings."
 )
-agent_executor = AgentExecutor.from_agent_and_tools(
-    agent=create_openai_functions_agent(llm=llm, tools=[search_knowledge_base, add_to_knowledge_base], system_message=SYSTEM_PROMPT),
-    tools=[search_knowledge_base, add_to_knowledge_base],
-    verbose=True,
-)
+agent = create_agent(llm=llm, tools=[search_knowledge_base, add_to_knowledge_base], system_message=SYSTEM_PROMPT)
 
 # Simple CLI client
 def main():
@@ -92,7 +88,7 @@ def main():
                 print(res["content"][:200] + "...")
         else:
             # Treat as normal user message to agent
-            response = agent_executor.invoke({"input": user_input})
+            response = agent.invoke({"input": user_input})
             print(response.get("output", ""))
 
 if __name__ == "__main__":
